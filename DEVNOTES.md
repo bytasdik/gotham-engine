@@ -14,9 +14,11 @@ This document explains how every part of `chess.cpp` works, why decisions were m
 6. [Move Generation — How It Works](#6-move-generation)
 7. [The Engine Class — Search](#7-the-engine-class)
 8. [Evaluation](#8-evaluation)
-9. [Input Parsing](#9-input-parsing)
-10. [Known Bugs and Gaps](#10-known-bugs-and-gaps)
-11. [Where to Improve Next](#11-where-to-improve-next)
+9. [`king_in_check()`](#9-king_in_check)
+10. [SAN Generation — `Move::san()`](#10-san-generation)
+11. [SAN Parsing — `parse_san()`](#11-san-parsing)
+12. [Known Bugs and Gaps](#12-known-bugs-and-gaps)
+13. [Where to Improve Next](#13-where-to-improve-next)
 
 ---
 
@@ -90,7 +92,12 @@ struct Move {
 
 Moves carry all the information needed to **apply and undo** them. This is called a "fat move" design. The alternative — a "thin move" that only stores `from`/`to` — would be smaller, but you'd need to look up captured pieces at apply time.
 
-`uci()` serializes the move to UCI string format (`e2e4`, `e7e8q`). The promotion piece type is appended as a lowercase letter if present.
+`Move` has two serialization methods:
+
+- `uci()` — internal format (`e2e4`, `e7e8q`). Kept for debugging.
+- `san(const Board& pre)` — Standard Algebraic Notation (`Nf3`, `exd5`, `O-O`, `e8=Q`). Requires the **pre-move board** because SAN is context-dependent: you need to know what other pieces of the same type can reach the same square to decide if disambiguation is needed, and you need to apply the move to detect check/checkmate.
+
+`san()` is forward-declared in the `Move` struct and defined after the `Board` class, since it calls `Board::apply()` and `Board::legal_moves()`.
 
 ---
 
@@ -279,62 +286,118 @@ This is a purely **static** evaluation — it doesn't look at attacks, mobility,
 
 ---
 
-## 9. Input Parsing
+## 9. `king_in_check()`
 
 ```cpp
-static std::optional<Move> parse_uci(const Board& board, const std::string& uci)
+static bool king_in_check(const Board& board, Color side)
 ```
 
-Takes a UCI string like `"e2e4"` or `"e7e8q"`, converts it to `(from, to)` squares, then finds the matching move in `legal_moves()`. Returns `std::nullopt` if the string is malformed or the move isn't legal.
+A standalone attack detector: given a board and a color, returns `true` if that color's king is currently attacked. It works by scanning outward from the king square in all directions — the same ray logic used by the slider generator — and checking whether an attacking piece sits at the end of each ray.
 
-The promotion character (`q`, `r`, `b`, `n`) in the input is currently **not checked** — whichever matching promotion move appears first in the list is returned. This means you can't choose your promotion piece from the command line yet (it defaults to whatever comes first, usually knight). This is a small bug to fix.
+It checks three attack types:
+
+- **Knight attacks** — fixed 8-delta table, boundary-checked
+- **Slider attacks** — rays in all 8 directions; stops at the first piece; checks if it's a bishop/queen (diagonals) or rook/queen (orthogonals); also catches pawn attacks on the first diagonal step
+- **King adjacency** — prevents two kings from standing next to each other (which the normal move generator doesn't catch on its own)
+
+This function exists primarily to power `san()` for `+`/`#` annotation. It is **not yet hooked into `legal_moves()`** to filter out moves that leave the king in check — that's the next step.
 
 ---
 
-## 10. Known Bugs and Gaps
+## 10. SAN Generation — `Move::san()`
 
-### No check detection
-The engine doesn't know when a king is in check. Consequences:
+```cpp
+std::string Move::san(const Board& pre) const
+```
+
+Builds the SAN string for a move. The steps in order:
+
+**Castling** — returns `O-O` or `O-O-O` immediately (determined by whether `to > from`), then appends `+` if needed.
+
+**Piece letter** — uppercase letter for the moving piece (`N`, `B`, `R`, `Q`, `K`). Omitted for pawns.
+
+**Disambiguation** — scans `legal_moves()` on the pre-move board to find any other piece of the same type that can also reach `to`. If found:
+- If they're on different files → add source file letter (`Raf1`)
+- If they're on different ranks → add source rank digit (`R1f3`)
+- If both (very rare) → add full source square (`Qd1f3` style)
+
+**Pawn capture prefix** — for pawn captures (including en passant), the source file is always added (`exd5`, `gxh8=Q`).
+
+**Capture symbol** — `x` if `captured` is non-empty or `is_ep` is true.
+
+**Destination square** — always present.
+
+**Promotion** — `=Q`, `=R`, `=B`, or `=N` if `promotion` is non-empty.
+
+**Check/checkmate** — applies the move with `pre.apply(*this)`, then calls `king_in_check()` on the resulting board. If the opponent is in check, filters their legal replies for any that escape check. If none escape → `#`, otherwise → `+`.
+
+---
+
+## 11. SAN Parsing — `parse_san()`
+
+```cpp
+static std::optional<Move> parse_san(const Board& board, std::string s)
+```
+
+Converts a SAN string typed by the user into a `Move` by matching it against `legal_moves()`.
+
+**Steps:**
+
+1. Strip trailing `+` and `#` (irrelevant for matching)
+2. Check for castling (`O-O` / `O-O-O`, also accepts `0-0`)
+3. Read optional leading piece letter. Absence means pawn.
+4. Strip promotion suffix from the end (`=Q`, `=R`, etc.)
+5. Remove `x` (capture marker) — its presence is advisory, not used for matching
+6. The last two characters are always the destination square
+7. Whatever remains (0–2 characters) is disambiguation: a file letter, a rank digit, or both
+8. Collect all legal moves that match `(piece type, destination, disambiguation, promotion)` into candidates
+9. Return the unique candidate, or `std::nullopt` if zero or ambiguous
+
+This approach — generate all legal moves first, then filter — means the parser never needs to know anything about piece movement rules itself. The legality check is entirely delegated to `Board::legal_moves()`.
+
+---
+
+## 12. Known Bugs and Gaps
+
+### No illegal move filtering
+`king_in_check()` exists and works correctly for check/checkmate annotation. But `legal_moves()` does not call it to filter out moves that leave the king in check. Consequences:
 - You can move into check without being stopped
-- The engine may leave its own king in check
-- Checkmate and stalemate are both detected as "no legal moves" and scored as `-INF` — so the engine treats stalemate (draw) as equivalent to being mated (loss), which is wrong
+- The engine may leave its own king in check during search
+- Castling through check is also allowed (castling only checks empty squares)
 
-### Castling through check
-`gen_king()` only checks empty squares, not attacked squares. The king can castle through or into check.
-
-### Promotion input
-`parse_uci()` doesn't read the promotion character from input. Promotions default to the first match in `legal_moves()` (knight).
+### Stalemate scored as loss
+When `legal_moves()` returns empty, `alpha_beta` returns `-INF`. This means stalemate (a draw) is scored identically to checkmate (a loss). The engine will sometimes blunder into stalemate thinking it's losing anyway.
 
 ### No draw detection
-No 50-move rule, no threefold repetition. The engine can repeat positions indefinitely.
+No 50-move rule, no threefold repetition. The engine has no game history so it can repeat positions indefinitely.
 
 ### No quiescence search
-The search stops at depth 0 and calls `evaluate()` even if the position is mid-exchange (e.g. you just captured a queen and the opponent hasn't recaptured yet). This causes the "horizon effect" — the engine misjudges these positions.
+The search stops at depth 0 and calls `evaluate()` even if the position is mid-exchange. If you just captured a queen and the opponent hasn't recaptured, the engine may overestimate the position's value. This is called the "horizon effect."
 
 ---
 
-## 11. Where to Improve Next
+## 13. Where to Improve Next
 
-These are listed in order of difficulty and impact:
+These are in order of priority and dependency:
 
-**1. Check detection (medium, high impact)**
-After generating a move, apply it and check if the king is attacked. The attack check can reuse the slider/knight logic. Filter out moves that leave the king in check. This also fixes castling through check and checkmate/stalemate distinction.
+**1. Filter illegal moves (medium effort, foundational)**
+After generating each candidate move in `legal_moves()`, apply it and call `king_in_check(post_board, side_to_move)`. Discard if true. This one change fixes: moving into check, castling through check, and correct checkmate/stalemate distinction. Everything below gets more reliable once this is in.
 
-**2. Fix promotion input (easy)**
-In `parse_uci()`, read `uci[4]` if present and match it against `m.promotion.type`.
+**2. Fix stalemate scoring (easy, depends on #1)**
+Once illegal moves are filtered, a position with zero legal moves is either checkmate or stalemate. Check `king_in_check()` on the current position: if in check → mate score (`-INF`), if not → stalemate score (`0`).
 
 **3. Quiescence search (medium, high impact)**
-At depth 0, instead of returning `evaluate()` immediately, continue searching captures only until the position is "quiet". This eliminates the horizon effect.
+At depth 0, instead of returning `evaluate()` immediately, continue searching captures-only until the position is "quiet" (no immediate captures available). This eliminates the horizon effect and is one of the biggest strength improvements available.
 
-**4. Iterative deepening (medium)**
-Instead of searching at a fixed depth, search depth 1, then 2, then 3, etc., within a time budget. This gives you time management for free and improves move ordering (you can use depth-1 results to sort depth-2 moves).
+**4. Iterative deepening + time management (medium)**
+Search depth 1, then 2, then 3, within a time budget rather than a fixed depth. Side effects: free time management, and earlier depths' results can be used to sort moves for later depths (improving cutoffs).
 
-**5. Transposition table (hard, high impact)**
-Cache `(board_hash → score)` to avoid re-evaluating the same position reached via different move orders. Requires a Zobrist hash of the board state.
+**5. Transposition table (harder, high impact)**
+Cache `(Zobrist hash → {score, depth, flag})` in a hash map. Avoids re-searching positions reached via different move orders. Requires computing a Zobrist hash incrementally in `apply()`.
 
-**6. Better evaluation (easy wins)**
-Without check detection, adding king safety is risky. But you can safely add:
-- Doubled pawn penalty (two pawns on same file)
-- Isolated pawn penalty (no friendly pawns on adjacent files)
-- Bishop pair bonus (+50 if you have both bishops)
-- Mobility bonus (count legal moves)
+**6. Better evaluation (easy wins, safe after #1)**
+Once illegal move filtering is in, it's safe to add king safety heuristics. Other quick wins:
+- Doubled pawn penalty (two pawns on same file: `-20` each)
+- Isolated pawn penalty (no pawns on adjacent files: `-15`)
+- Bishop pair bonus (`+50` if both bishops present)
+- Passed pawn bonus (no enemy pawns blocking or attacking the path to promotion)

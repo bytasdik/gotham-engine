@@ -42,6 +42,9 @@ struct Piece {
     bool operator==(const Piece& o) const { return type == o.type && color == o.color; }
 };
 
+// Forward declaration so Move::san() can reference Board
+class Board;
+
 // ─────────────────────────────────────────────
 //  Move
 // ─────────────────────────────────────────────
@@ -54,6 +57,7 @@ struct Move {
     bool  is_castle = false;
     bool  is_ep     = false;
 
+    // UCI string — kept for internal use / debugging
     std::string uci() const {
         std::string s;
         s += static_cast<char>('a' + (from % 8));
@@ -66,6 +70,9 @@ struct Move {
         }
         return s;
     }
+
+    // SAN — forward-declared; defined after Board class
+    std::string san(const Board& pre) const;
 };
 
 // ─────────────────────────────────────────────
@@ -429,24 +436,251 @@ private:
 };
 
 // ─────────────────────────────────────────────
-//  Input / Output helpers
+//  SAN generation  (defined after Board)
 // ─────────────────────────────────────────────
 
-static std::optional<Move> parse_uci(const Board& board, const std::string& uci) {
-    if (uci.size() < 4) return std::nullopt;
-    auto to_sq = [](char f, char r) -> int {
-        if (f < 'a' || f > 'h' || r < '1' || r > '8') return -1;
-        return (r - '1') * 8 + (f - 'a');
-    };
-    int from = to_sq(uci[0], uci[1]);
-    int to   = to_sq(uci[2], uci[3]);
-    if (from < 0 || to < 0) return std::nullopt;
+// Helper: is the king of `side` attacked on `board`?
+static bool king_in_check(const Board& board, Color side) {
+    // Find king square
+    int king_sq = -1;
+    for (int sq = 0; sq < 64; sq++)
+        if (board.squares[sq].type == KING && board.squares[sq].color == side)
+            { king_sq = sq; break; }
+    if (king_sq < 0) return false;
 
-    for (const auto& m : board.legal_moves())
-        if (m.from == from && m.to == to)
-            return m;
+    // Check knight attacks
+    static constexpr int ndr[] = {-2,-2,-1,-1, 1, 1, 2, 2};
+    static constexpr int ndc[] = {-1, 1,-2, 2,-2, 2,-1, 1};
+    int kr = king_sq / 8, kc = king_sq % 8;
+    for (int i = 0; i < 8; i++) {
+        int nr = kr + ndr[i], nc = kc + ndc[i];
+        if (nr < 0 || nr > 7 || nc < 0 || nc > 7) continue;
+        Piece p = board.squares[nr * 8 + nc];
+        if (p.type == KNIGHT && p.color != side) return true;
+    }
+    // Check slider/pawn attacks
+    static constexpr int dr[] = { 1,-1, 0, 0, 1, 1,-1,-1};
+    static constexpr int dc[] = { 0, 0, 1,-1, 1,-1, 1,-1};
+    for (int d = 0; d < 8; d++) {
+        for (int step = 1; step < 8; step++) {
+            int nr = kr + dr[d]*step, nc = kc + dc[d]*step;
+            if (nr < 0 || nr > 7 || nc < 0 || nc > 7) break;
+            Piece p = board.squares[nr * 8 + nc];
+            if (p.empty()) continue;
+            if (p.color == side) break; // own piece blocks
+            bool diag = (d >= 4);
+            bool orth = (d < 4);
+            if (diag && (p.type == BISHOP || p.type == QUEEN)) return true;
+            if (orth && (p.type == ROOK   || p.type == QUEEN)) return true;
+            // Pawn attacks: only on first diagonal step
+            if (step == 1 && diag && p.type == PAWN) {
+                int pawn_dir = (side == WHITE) ? 1 : -1;
+                if (dr[d] == pawn_dir) return true;
+            }
+            break;
+        }
+    }
+    // King adjacency (prevent kings touching)
+    static constexpr int kdr[] = {-1,-1,-1,0,0,1,1,1};
+    static constexpr int kdc[] = {-1, 0, 1,-1,1,-1,0,1};
+    for (int i = 0; i < 8; i++) {
+        int nr = kr + kdr[i], nc = kc + kdc[i];
+        if (nr < 0 || nr > 7 || nc < 0 || nc > 7) continue;
+        Piece p = board.squares[nr * 8 + nc];
+        if (p.type == KING && p.color != side) return true;
+    }
+    return false;
+}
 
-    return std::nullopt;
+std::string Move::san(const Board& pre) const {
+    // Castling
+    if (is_castle) {
+        std::string s = (to > from) ? "O-O" : "O-O-O";
+        Board post = pre.apply(*this);
+        if (king_in_check(post, post.side_to_move)) s += '+';
+        return s;
+    }
+
+    Piece moving = pre.squares[from];
+    std::string s;
+
+    static const char piece_letter[] = ".PNBRQK";
+
+    // Piece prefix (omit for pawns)
+    if (moving.type != PAWN)
+        s += piece_letter[moving.type];
+
+    // Disambiguation: find other pieces of same type that can reach `to`
+    if (moving.type != PAWN) {
+        auto all = pre.legal_moves();
+        std::vector<int> ambig;
+        for (const auto& m : all)
+            if (m.to == to && m.from != from &&
+                pre.squares[m.from].type == moving.type &&
+                pre.squares[m.from].color == moving.color)
+                ambig.push_back(m.from);
+
+        if (!ambig.empty()) {
+            bool same_file = false, same_rank = false;
+            for (int sq : ambig) {
+                if ((sq % 8) == (from % 8)) same_file = true;
+                if ((sq / 8) == (from / 8)) same_rank = true;
+            }
+            if (!same_file)       s += static_cast<char>('a' + (from % 8));
+            else if (!same_rank)  s += static_cast<char>('1' + (from / 8));
+            else {
+                s += static_cast<char>('a' + (from % 8));
+                s += static_cast<char>('1' + (from / 8));
+            }
+        }
+    }
+
+    // Pawn capture: always include source file
+    if (moving.type == PAWN && (!captured.empty() || is_ep))
+        s += static_cast<char>('a' + (from % 8));
+
+    // Capture symbol
+    if (!captured.empty() || is_ep)
+        s += 'x';
+
+    // Destination square
+    s += static_cast<char>('a' + (to % 8));
+    s += static_cast<char>('1' + (to / 8));
+
+    // Promotion
+    if (!promotion.empty()) {
+        s += '=';
+        s += piece_letter[promotion.type];
+    }
+
+    // Check / checkmate indicator
+    Board post = pre.apply(*this);
+    if (king_in_check(post, post.side_to_move)) {
+        auto replies = post.legal_moves();
+        // Filter out replies that leave own king in check
+        bool has_legal = false;
+        for (const auto& r : replies) {
+            Board after = post.apply(r);
+            if (!king_in_check(after, post.side_to_move)) { has_legal = true; break; }
+        }
+        s += has_legal ? '+' : '#';
+    }
+
+    return s;
+}
+
+// ─────────────────────────────────────────────
+//  SAN parser
+// ─────────────────────────────────────────────
+
+// Parse Standard Algebraic Notation into a Move.
+// Accepts: e4, Nf3, exd5, O-O, O-O-O, e8=Q, Raxd1, etc.
+static std::optional<Move> parse_san(const Board& board, std::string s) {
+    // Strip check/mate indicators
+    while (!s.empty() && (s.back() == '+' || s.back() == '#')) s.pop_back();
+    if (s.empty()) return std::nullopt;
+
+    auto legal = board.legal_moves();
+
+    // ── Castling ──────────────────────────────
+    if (s == "O-O" || s == "0-0") {
+        for (const auto& m : legal)
+            if (m.is_castle && m.to > m.from) return m;
+        return std::nullopt;
+    }
+    if (s == "O-O-O" || s == "0-0-0") {
+        for (const auto& m : legal)
+            if (m.is_castle && m.to < m.from) return m;
+        return std::nullopt;
+    }
+
+    // ── Decode fields ─────────────────────────
+    // Grammar (simplified):
+    //   [Piece][file][rank][x]<file><rank>[=Piece]
+    // Where [] = optional.
+
+    PieceType piece = PAWN;
+    int  src_file = -1, src_rank = -1;  // disambiguation
+    bool capture  = false;
+    int  dst_file = -1, dst_rank = -1;
+    PieceType promo = NONE;
+
+    size_t i = 0;
+
+    // Piece letter
+    if (s[i] >= 'A' && s[i] <= 'Z') {
+        switch (s[i]) {
+            case 'N': piece = KNIGHT; break;
+            case 'B': piece = BISHOP; break;
+            case 'R': piece = ROOK;   break;
+            case 'Q': piece = QUEEN;  break;
+            case 'K': piece = KING;   break;
+            default: return std::nullopt;
+        }
+        i++;
+    }
+
+    // Collect remaining lowercase/digit/x characters
+    // Pattern after piece letter: [file][rank][x]<file><rank>[=P]
+    // We read left-to-right and figure out what's disambiguation vs destination.
+    std::string rest = s.substr(i);
+
+    // Strip promotion suffix  e.g. "=Q"
+    if (rest.size() >= 2 && rest[rest.size()-2] == '=') {
+        char pc = rest.back();
+        switch (pc) {
+            case 'Q': promo = QUEEN;  break;
+            case 'R': promo = ROOK;   break;
+            case 'B': promo = BISHOP; break;
+            case 'N': promo = KNIGHT; break;
+            default: return std::nullopt;
+        }
+        rest = rest.substr(0, rest.size() - 2);
+    }
+
+    // Remove capture 'x' and remember it
+    {
+        auto xpos = rest.find('x');
+        if (xpos != std::string::npos) { capture = true; rest.erase(xpos, 1); }
+    }
+
+    // Now `rest` should be 2–4 alphanumeric chars: [file][rank]<file><rank>
+    // Destination is always the last file+rank pair.
+    if (rest.size() < 2) return std::nullopt;
+
+    dst_file = rest[rest.size()-2] - 'a';
+    dst_rank = rest[rest.size()-1] - '1';
+    if (dst_file < 0 || dst_file > 7 || dst_rank < 0 || dst_rank > 7) return std::nullopt;
+
+    rest = rest.substr(0, rest.size() - 2); // remove destination
+
+    // Whatever remains is disambiguation
+    for (char c : rest) {
+        if (c >= 'a' && c <= 'h') src_file = c - 'a';
+        else if (c >= '1' && c <= '8') src_rank = c - '1';
+        else return std::nullopt;
+    }
+
+    int dst_sq = dst_rank * 8 + dst_file;
+
+    // ── Match against legal moves ──────────────
+    std::vector<Move> candidates;
+    for (const auto& m : legal) {
+        if (m.to != dst_sq) continue;
+        if (board.squares[m.from].type != piece) continue;
+        if (src_file >= 0 && (m.from % 8) != src_file) continue;
+        if (src_rank >= 0 && (m.from / 8) != src_rank) continue;
+        if (promo != NONE && m.promotion.type != promo) continue;
+        if (promo == NONE && !m.promotion.empty()) continue;
+        (void)capture; // capture flag is advisory; legality already checked
+        candidates.push_back(m);
+    }
+
+    if (candidates.size() == 1) return candidates[0];
+    if (candidates.empty())     return std::nullopt;
+
+    // Multiple candidates: shouldn't happen with valid SAN, but pick first
+    return candidates[0];
 }
 
 // ─────────────────────────────────────────────
@@ -455,35 +689,40 @@ static std::optional<Move> parse_uci(const Board& board, const std::string& uci)
 
 int main() {
     std::cout << "╔══════════════════════════════╗\n";
-    std::cout << "║   C++ Chess Engine  v2.0     ║\n";
+    std::cout << "║     Gotham Engine  v2.1      ║\n";
     std::cout << "╚══════════════════════════════╝\n";
-    std::cout << "You play White. Enter moves in UCI format (e.g. e2e4).\n";
+    std::cout << "You play White. Enter moves in Standard Algebraic Notation.\n";
+    std::cout << "Examples: e4  Nf3  exd5  O-O  e8=Q\n";
     std::cout << "Type 'quit' to exit.\n\n";
 
     Board board = Board::starting_position();
     Engine engine(SEARCH_DEPTH);
+
+    int move_number = 1;
 
     while (true) {
         board.print();
 
         if (board.side_to_move == WHITE) {
             std::string input;
-            std::cout << "Your move: ";
+            std::cout << move_number << ". Your move: ";
             std::getline(std::cin, input);
             if (input == "quit") break;
 
-            auto move = parse_uci(board, input);
+            auto move = parse_san(board, input);
             if (!move) {
-                std::cout << "Illegal move. Try again.\n\n";
+                std::cout << "Illegal or unrecognized move. Try again.\n\n";
                 continue;
             }
+            std::cout << move_number << ". " << move->san(board) << "\n\n";
             board = board.apply(*move);
 
         } else {
             std::cout << "Engine thinking...\n";
             Move m = engine.best_move(board);
-            std::cout << "Engine plays: " << m.uci() << "\n\n";
+            std::cout << move_number << "... " << m.san(board) << "\n\n";
             board = board.apply(m);
+            move_number++;
         }
     }
 
